@@ -3,47 +3,46 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Feuerwehr - Das Spiel</title>
+    <title>Fire Department - 3D Firefighter</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
-    <div class="game-container">
-        <h1>Feuerwehr - Das Spiel</h1>
-        <div class="hud">
-            <div class="hud-item">
-                <span class="label">Punkte:</span>
-                <span id="score">0</span>
-            </div>
-            <div class="hud-item">
-                <span class="label">Wasser:</span>
-                <div class="water-bar">
-                    <div id="water-fill" class="water-fill"></div>
-                </div>
-            </div>
-            <div class="hud-item">
-                <span class="label">Leben:</span>
-                <span id="lives">3</span>
-            </div>
-            <div class="hud-item">
-                <span class="label">Level:</span>
-                <span id="level">1</span>
-            </div>
+    <div id="canvas-container"></div>
+
+    <div id="hud">
+        <div class="hud-block">
+            <div class="hud-row"><span class="label">SCORE</span><span id="score">0</span></div>
+            <div class="hud-row"><span class="label">LEVEL</span><span id="level">1</span></div>
+            <div class="hud-row"><span class="label">LIVES</span><span id="lives">3</span></div>
         </div>
-        <canvas id="game" width="800" height="600"></canvas>
-        <div id="overlay" class="overlay">
-            <div class="overlay-content">
-                <h2 id="overlay-title">Feuerwehr</h2>
-                <p id="overlay-message">Lösche alle Brände, bevor die Gebäude abbrennen!</p>
-                <div class="controls-help">
-                    <p><strong>Steuerung:</strong></p>
-                    <p>Pfeiltasten oder WASD - Bewegen</p>
-                    <p>Leertaste - Wasser spritzen</p>
-                    <p>Hydranten (blau) berühren - Tank auffüllen</p>
-                </div>
-                <button id="start-btn">Start</button>
-            </div>
+        <div class="hud-block water-block">
+            <div class="label">WATER</div>
+            <div class="water-bar"><div id="water-fill"></div></div>
         </div>
     </div>
+
+    <div id="crosshair">+</div>
+    <div id="interact-prompt" class="hidden"></div>
+    <div id="message" class="hidden"></div>
+
+    <div id="overlay">
+        <div class="overlay-content">
+            <h1>FIRE DEPARTMENT</h1>
+            <p class="subtitle">3D Firefighter &mdash; American Style</p>
+            <div class="controls">
+                <h3>Steuerung</h3>
+                <p><strong>WASD / Pfeiltasten</strong> &mdash; Bewegen</p>
+                <p><strong>Maus</strong> &mdash; Umsehen</p>
+                <p><strong>Linksklick</strong> &mdash; Wasser spritzen</p>
+                <p><strong>E</strong> &mdash; Gerätefach öffnen / Hydrant</p>
+                <p><strong>ESC</strong> &mdash; Mauszeiger freigeben</p>
+            </div>
+            <p class="hint">Öffne die Gerätefächer am Truck und lösche alle Brände in der Stadt!</p>
+            <button id="start-btn">EINSATZ STARTEN</button>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
     <script src="game.js"></script>
 </body>
 </html>
