@@ -19,6 +19,13 @@ const state = {
         yaw: -Math.PI * 0.85,
         pitch: -0.05,
     },
+    // Driving mode
+    drivingTruck: false,
+    truckPos: new THREE.Vector3(0, 0, 5),
+    truckYaw: 0,
+    truckSpeed: 0,
+    // Interior building the player is currently inside (if any)
+    currentInterior: null,
     spraying: false,
     nozzleMode: 'stream',   // 'stream' (long range, high damage) or 'fog' (cone, low damage)
     hoseConnected: true,
@@ -45,6 +52,10 @@ const SIM = {
 const keys = {};
 let mouseLocked = false;
 let messageTimer = 0;
+
+// Filled later in the BUILDINGS section once a hollow building exists
+let interiorHouse = null;
+function applyInteriorCollision(_house, _pos) { /* filled below */ }
 
 // ============================================================
 // RENDERER
@@ -514,11 +525,10 @@ MAT.brick.needsUpdate = true;
 }
 
 // ============================================================
-// TRUCK CONTAINER
+// TRUCK CONTAINER (moveable - position driven by state.truckPos)
 // ============================================================
-const TRUCK_POS = new THREE.Vector3(0, 0, 5);
 const truckGroup = new THREE.Group();
-truckGroup.position.copy(TRUCK_POS);
+truckGroup.position.copy(state.truckPos);
 scene.add(truckGroup);
 
 // ============================================================
@@ -1517,6 +1527,334 @@ function buildHouse(x, z, rotY, opts) {
     return g;
 }
 
+// --- Hollow house: walkable interior with doorway + furniture ---
+// Returns a descriptor used for collision and mission spawning.
+function buildHollowHouse(x, z, rotY, opts) {
+    opts = opts || {};
+    const g = new THREE.Group();
+    const w = 12, d = 9, h = 4.2;
+    const wallThick = 0.2;
+    const doorW = 1.8;
+    const wallTex = opts.wallTex || TEX.sidingBlue;
+
+    const wallMatExt = new THREE.MeshStandardMaterial({
+        map: wallTex, roughness: 0.8
+    });
+    const interiorMat = new THREE.MeshStandardMaterial({
+        color: 0xd8cfbe, roughness: 0.9
+    });
+
+    // Floor (wooden)
+    const floorTex = TEX.sidingYellow.clone();
+    floorTex.wrapS = floorTex.wrapT = THREE.RepeatWrapping;
+    floorTex.repeat.set(4, 3);
+    floorTex.needsUpdate = true;
+    const floor = new THREE.Mesh(
+        new THREE.BoxGeometry(w - wallThick * 2, 0.1, d - wallThick * 2),
+        new THREE.MeshStandardMaterial({ map: floorTex, roughness: 0.7 })
+    );
+    floor.position.y = 0.05;
+    floor.receiveShadow = true;
+    g.add(floor);
+
+    // Ceiling
+    const ceiling = new THREE.Mesh(
+        new THREE.BoxGeometry(w - wallThick * 2, 0.1, d - wallThick * 2),
+        new THREE.MeshStandardMaterial({ color: 0xf0ece0, roughness: 0.95 })
+    );
+    ceiling.position.y = h - 0.05;
+    g.add(ceiling);
+
+    // Back wall
+    const backWall = new THREE.Mesh(
+        new THREE.BoxGeometry(w, h, wallThick), wallMatExt);
+    backWall.position.set(0, h / 2, -d / 2);
+    backWall.castShadow = true;
+    backWall.receiveShadow = true;
+    g.add(backWall);
+
+    // Front wall split around a doorway
+    const frontLeftW = (w - doorW) / 2;
+    const frontLeft = new THREE.Mesh(
+        new THREE.BoxGeometry(frontLeftW, h, wallThick), wallMatExt);
+    frontLeft.position.set(-(doorW / 2 + frontLeftW / 2), h / 2, d / 2);
+    frontLeft.castShadow = true;
+    g.add(frontLeft);
+    const frontRight = frontLeft.clone();
+    frontRight.position.x = (doorW / 2 + frontLeftW / 2);
+    g.add(frontRight);
+    // Header above the door
+    const header = new THREE.Mesh(
+        new THREE.BoxGeometry(doorW + 0.1, h - 2.2, wallThick), wallMatExt);
+    header.position.set(0, h - (h - 2.2) / 2, d / 2);
+    g.add(header);
+
+    // Side walls
+    const sideWall = new THREE.Mesh(
+        new THREE.BoxGeometry(wallThick, h, d - wallThick * 2), wallMatExt);
+    sideWall.position.set(-w / 2 + wallThick / 2, h / 2, 0);
+    sideWall.castShadow = true;
+    sideWall.receiveShadow = true;
+    g.add(sideWall);
+    const sideWall2 = sideWall.clone();
+    sideWall2.position.x = w / 2 - wallThick / 2;
+    g.add(sideWall2);
+
+    // Gabled roof on top
+    const roofShape = new THREE.Shape();
+    roofShape.moveTo(-w / 2 - 0.3, 0);
+    roofShape.lineTo(w / 2 + 0.3, 0);
+    roofShape.lineTo(w / 2 + 0.3, 0.3);
+    roofShape.lineTo(0, 2.5);
+    roofShape.lineTo(-w / 2 - 0.3, 0.3);
+    roofShape.lineTo(-w / 2 - 0.3, 0);
+    const roofGeo = new THREE.ExtrudeGeometry(roofShape, {
+        depth: d + 0.6, bevelEnabled: false
+    });
+    roofGeo.translate(0, 0, -(d + 0.6) / 2);
+    const rt = TEX.roof.clone();
+    rt.wrapS = rt.wrapT = THREE.RepeatWrapping;
+    rt.repeat.set(3, 2);
+    rt.needsUpdate = true;
+    const roof = new THREE.Mesh(roofGeo,
+        new THREE.MeshStandardMaterial({ map: rt, roughness: 0.85 }));
+    roof.position.y = h;
+    roof.castShadow = true;
+    g.add(roof);
+
+    // Gable fills
+    const gable = new THREE.Shape();
+    gable.moveTo(-w / 2 - 0.3, 0);
+    gable.lineTo(w / 2 + 0.3, 0);
+    gable.lineTo(w / 2 + 0.3, 0.3);
+    gable.lineTo(0, 2.5);
+    gable.lineTo(-w / 2 - 0.3, 0.3);
+    gable.lineTo(-w / 2 - 0.3, 0);
+    const gf = new THREE.Mesh(
+        new THREE.ShapeGeometry(gable), wallMatExt);
+    gf.position.set(0, h, d / 2 + 0.3);
+    g.add(gf);
+    const gf2 = gf.clone();
+    gf2.position.z = -d / 2 - 0.3;
+    gf2.rotation.y = Math.PI;
+    g.add(gf2);
+
+    // Porch in front of the doorway
+    const porchDeck = new THREE.Mesh(
+        new THREE.BoxGeometry(4, 0.3, 1.8),
+        new THREE.MeshStandardMaterial({ color: 0x9a7a4a, roughness: 0.8 })
+    );
+    porchDeck.position.set(0, 0.3, d / 2 + 0.9);
+    g.add(porchDeck);
+
+    // === INTERIOR FURNITURE ===
+    // Couch (3-seater)
+    const couchMat = new THREE.MeshStandardMaterial({ color: 0x6a4a3a, roughness: 0.85 });
+    const couchBase = new THREE.Mesh(new THREE.BoxGeometry(3.2, 0.5, 1.0), couchMat);
+    couchBase.position.set(-3, 0.35, -3);
+    g.add(couchBase);
+    const couchBack = new THREE.Mesh(new THREE.BoxGeometry(3.2, 0.9, 0.3), couchMat);
+    couchBack.position.set(-3, 0.85, -3.45);
+    g.add(couchBack);
+    for (const sx of [-1.4, 1.4]) {
+        const arm = new THREE.Mesh(new THREE.BoxGeometry(0.3, 0.8, 1.0), couchMat);
+        arm.position.set(-3 + sx, 0.65, -3);
+        g.add(arm);
+    }
+
+    // Coffee table
+    const table = new THREE.Mesh(
+        new THREE.BoxGeometry(1.6, 0.08, 0.8),
+        new THREE.MeshStandardMaterial({ color: 0x3a2a1a, roughness: 0.4, metalness: 0.1 })
+    );
+    table.position.set(-3, 0.55, -1.8);
+    g.add(table);
+    for (const [sx, sz] of [[-0.7, -0.3], [0.7, -0.3], [-0.7, 0.3], [0.7, 0.3]]) {
+        const leg = new THREE.Mesh(
+            new THREE.BoxGeometry(0.08, 0.5, 0.08),
+            new THREE.MeshStandardMaterial({ color: 0x2a1a10 })
+        );
+        leg.position.set(-3 + sx, 0.25, -1.8 + sz);
+        g.add(leg);
+    }
+
+    // TV stand + TV
+    const tvStand = new THREE.Mesh(
+        new THREE.BoxGeometry(2.0, 0.5, 0.5),
+        new THREE.MeshStandardMaterial({ color: 0x3a2a1a })
+    );
+    tvStand.position.set(-3, 0.3, 3.2);
+    g.add(tvStand);
+    const tv = new THREE.Mesh(
+        new THREE.BoxGeometry(1.6, 0.9, 0.08),
+        new THREE.MeshStandardMaterial({
+            color: 0x0a0a0a, emissive: 0x112244, emissiveIntensity: 0.4
+        })
+    );
+    tv.position.set(-3, 1.1, 3.2);
+    g.add(tv);
+
+    // Kitchen counter on the right side
+    const counter = new THREE.Mesh(
+        new THREE.BoxGeometry(4.5, 0.9, 0.8),
+        new THREE.MeshStandardMaterial({ color: 0xd0c8b8, roughness: 0.6 })
+    );
+    counter.position.set(3, 0.45, -2);
+    g.add(counter);
+    const counterTop = new THREE.Mesh(
+        new THREE.BoxGeometry(4.6, 0.06, 0.85),
+        new THREE.MeshStandardMaterial({ color: 0x1a1410, roughness: 0.3, metalness: 0.3 })
+    );
+    counterTop.position.set(3, 0.93, -2);
+    g.add(counterTop);
+    // Stove top (the fire source)
+    const stove = new THREE.Mesh(
+        new THREE.BoxGeometry(1.0, 0.03, 0.8),
+        new THREE.MeshStandardMaterial({ color: 0x111111, metalness: 0.5, roughness: 0.3 })
+    );
+    stove.position.set(4, 0.97, -2);
+    g.add(stove);
+    // Stove burners
+    for (const [bx, bz] of [[-0.3, -0.2], [0.3, -0.2], [-0.3, 0.2], [0.3, 0.2]]) {
+        const burner = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.12, 0.12, 0.02, 12),
+            new THREE.MeshStandardMaterial({ color: 0x2a2a2a })
+        );
+        burner.position.set(4 + bx, 0.99, -2 + bz);
+        g.add(burner);
+    }
+    // Kitchen cabinets on wall
+    const cabinet = new THREE.Mesh(
+        new THREE.BoxGeometry(4.5, 0.7, 0.4),
+        new THREE.MeshStandardMaterial({ color: 0xc4a878, roughness: 0.5 })
+    );
+    cabinet.position.set(3, 2.8, -3.2);
+    g.add(cabinet);
+
+    // Dining table with 2 chairs
+    const dTable = new THREE.Mesh(
+        new THREE.BoxGeometry(1.4, 0.06, 1.0),
+        new THREE.MeshStandardMaterial({ color: 0x9a7a4a })
+    );
+    dTable.position.set(3, 0.9, 1.5);
+    g.add(dTable);
+    for (const [sx, sz] of [[-0.6, -0.4], [0.6, -0.4], [-0.6, 0.4], [0.6, 0.4]]) {
+        const leg = new THREE.Mesh(
+            new THREE.BoxGeometry(0.06, 0.9, 0.06),
+            new THREE.MeshStandardMaterial({ color: 0x6a4a2a })
+        );
+        leg.position.set(3 + sx, 0.45, 1.5 + sz);
+        g.add(leg);
+    }
+    for (const cz of [0.9, 2.1]) {
+        const chair = new THREE.Mesh(
+            new THREE.BoxGeometry(0.55, 0.55, 0.55),
+            new THREE.MeshStandardMaterial({ color: 0x8a6a4a })
+        );
+        chair.position.set(3, 0.27, cz);
+        g.add(chair);
+        const cback = new THREE.Mesh(
+            new THREE.BoxGeometry(0.55, 0.5, 0.06),
+            new THREE.MeshStandardMaterial({ color: 0x8a6a4a })
+        );
+        cback.position.set(3, 0.8, cz + (cz < 1.5 ? -0.25 : 0.25));
+        g.add(cback);
+    }
+
+    // Interior warm light
+    const interiorLight = new THREE.PointLight(0xffcc88, 0.8, 14, 2);
+    interiorLight.position.set(0, h - 0.4, 0);
+    g.add(interiorLight);
+
+    g.position.set(x, 0, z);
+    g.rotation.y = rotY || 0;
+    scene.add(g);
+
+    // Return descriptor used by collision + missions
+    return {
+        group: g,
+        x, z, rotY: rotY || 0,
+        w, d, h,
+        wallThick,
+        doorW,
+        // Door gap is on the LOCAL +Z front wall
+        // Interior fire spawn spots (in world coordinates after rotation)
+        interiorSpots: [
+            [4.0, -2.0],       // kitchen stove
+            [-3.0, -3.2],      // couch
+            [-3.0, 3.0],       // tv area
+            [3.0, 1.5],        // dining table
+        ].map(([lx, lz]) => {
+            // rotate local -> world around (x, z)
+            const cs = Math.cos(rotY || 0);
+            const sn = Math.sin(rotY || 0);
+            return [x + lx * cs + lz * sn, z - lx * sn + lz * cs];
+        }),
+    };
+}
+
+// Replace the real interior collision stub defined near the top
+applyInteriorCollision = function (house, pos) {
+    // Transform world pos into house-local space
+    const dx = pos.x - house.x;
+    const dz = pos.z - house.z;
+    const cs = Math.cos(-house.rotY);
+    const sn = Math.sin(-house.rotY);
+    let lx = dx * cs - dz * sn;
+    let lz = dx * sn + dz * cs;
+
+    const halfW = house.w / 2;
+    const halfD = house.d / 2;
+    const wt = house.wallThick;
+    const doorHalf = house.doorW / 2;
+    const playerR = 0.35;
+
+    // Helper: is a given (lx, lz) inside the building footprint?
+    const wasInside =
+        Math.abs(lx) < halfW - wt &&
+        Math.abs(lz) < halfD - wt;
+
+    if (wasInside) {
+        // Clamp to interior box, BUT allow passing through the door gap
+        const atDoor = Math.abs(lx) < doorHalf && lz > halfD - wt - 0.5;
+        if (!atDoor) {
+            lx = Math.max(-halfW + wt + playerR, Math.min(halfW - wt - playerR, lx));
+            lz = Math.max(-halfD + wt + playerR, Math.min(halfD - wt - playerR, lz));
+        }
+    } else {
+        // Outside: block penetration into the building except through the door
+        if (Math.abs(lx) < halfW + playerR && Math.abs(lz) < halfD + playerR) {
+            // Near the front wall (+Z side)?
+            const frontDist = Math.abs(lz - halfD);
+            const otherWallDist = Math.min(
+                Math.abs(lz + halfD),
+                Math.abs(lx - halfW),
+                Math.abs(lx + halfW)
+            );
+            if (frontDist < otherWallDist && Math.abs(lx) < doorHalf) {
+                // Allow entry via door gap - no clamp
+            } else {
+                // Push out along shortest axis
+                const pushFront = halfD + playerR - lz;
+                const pushBack  = lz + halfD + playerR;
+                const pushRight = halfW + playerR - lx;
+                const pushLeft  = lx + halfW + playerR;
+                const mn = Math.min(pushFront, pushBack, pushRight, pushLeft);
+                if (mn === pushFront) lz = halfD + playerR;
+                else if (mn === pushBack) lz = -halfD - playerR;
+                else if (mn === pushRight) lx = halfW + playerR;
+                else lx = -halfW - playerR;
+            }
+        }
+    }
+
+    // Transform local back to world
+    const cs2 = Math.cos(house.rotY);
+    const sn2 = Math.sin(house.rotY);
+    pos.x = house.x + lx * cs2 - lz * sn2;
+    pos.z = house.z + lx * sn2 + lz * cs2;
+};
+
 // --- Apartment/office block with balconies ---
 function buildApartment(x, z, rotY) {
     const g = new THREE.Group();
@@ -1816,17 +2154,16 @@ function buildGasStation(x, z, rotY) {
 }
 
 // Place 6 buildings + gas station around the map
+// The blue suburban house is hollow and walkable; doorway opens toward
+// the street (front = local +Z, so rotY places that side toward the truck).
+interiorHouse = buildHollowHouse( 40,  25,  Math.PI, { wallTex: TEX.sidingBlue });
+
 const BUILDINGS = [
-    buildHouse     ( 42,  28, -Math.PI / 2, { wallTex: TEX.sidingBlue   }),
     buildHouse     ( 42,  12, -Math.PI / 2, { wallTex: TEX.sidingYellow }),
     buildHouse     (-42,  28,  Math.PI / 2, { wallTex: TEX.sidingWhite  }),
     buildApartment (-42, -10,  Math.PI / 2),
     buildCommercial( 42, -22, -Math.PI / 2, "JOE'S DINER"),
     buildGasStation(-10, -38,  0),
-];
-// Fire-spawn candidate positions (one per building, near the front)
-const BUILDING_FIRE_SPOTS = [
-    [ 38,  28], [ 38,  12], [-38,  28], [-38, -10], [ 38, -22], [-10, -35],
 ];
 
 // ============================================================
@@ -2377,11 +2714,12 @@ function createFire(x, z) {
 // ============================================================
 const MISSIONS = [
     {
-        id: 'house_blue',
-        name: 'Wohnungsbrand - Blaue Villa',
-        objective: 'Lösche alle Brandherde am Einfamilienhaus',
-        bonus: 500,
-        spots: [[42, 28], [40, 30], [44, 26]],
+        id: 'house_interior',
+        name: 'Zimmerbrand - Blaue Villa',
+        objective: 'Fahr zur Blauen Villa und betrete das Haus durch die Haustür - Brand in Küche und Wohnzimmer',
+        bonus: 800,
+        // Spawn inside the hollow house (coordinates come from the house descriptor below)
+        spotsFromInterior: true,
     },
     {
         id: 'diner_grease',
@@ -2439,11 +2777,19 @@ function startMission(index) {
     state.currentMission = mission;
     state.missionIndex = index;
 
-    for (const [x, z] of mission.spots) {
-        state.fires.push(createFire(
-            x + (Math.random() - 0.5) * 2.5,
-            z + (Math.random() - 0.5) * 2.5
-        ));
+    // Resolve spots: either a static list or pulled from an interior descriptor
+    let spots = mission.spots;
+    if (mission.spotsFromInterior && interiorHouse) {
+        spots = interiorHouse.interiorSpots;
+    }
+
+    if (spots) {
+        for (const [x, z] of spots) {
+            state.fires.push(createFire(
+                x + (Math.random() - 0.5) * 1.5,
+                z + (Math.random() - 0.5) * 1.5
+            ));
+        }
     }
 
     // Show briefing message
@@ -2558,6 +2904,7 @@ function updateWaterParticles(dt) {
 document.addEventListener('keydown', e => {
     keys[e.code] = true;
     if (e.code === 'KeyE') tryInteract();
+    if (e.code === 'KeyF') toggleDrive();
     if (e.code === 'Digit1') {
         state.nozzleMode = 'stream';
         updateHUD();
@@ -2569,6 +2916,78 @@ document.addEventListener('keydown', e => {
         showMessage('Sprühnebel', 1);
     }
 });
+
+// ============================================================
+// DRIVING MODE
+// ============================================================
+function toggleDrive() {
+    if (!state.running) return;
+    if (state.drivingTruck) {
+        // Exit at the driver door (-x side of local frame)
+        state.drivingTruck = false;
+        const exitLocal = new THREE.Vector3(-2.8, 0, -3.4);
+        exitLocal.applyAxisAngle(new THREE.Vector3(0, 1, 0), state.truckYaw);
+        state.player.pos.copy(state.truckPos).add(exitLocal);
+        state.player.pos.y = 1.7;
+        state.player.yaw = state.truckYaw + Math.PI / 2;
+        state.truckSpeed = 0;
+        hoseLine.visible = true;
+        showMessage('Ausgestiegen', 1.2);
+    } else {
+        // Must be near the truck to enter
+        const dist = state.player.pos.distanceTo(state.truckPos);
+        if (dist < 6) {
+            state.drivingTruck = true;
+            hoseLine.visible = false;
+            showMessage('Einsteigen - W/S gas, A/D lenken', 2);
+        } else {
+            showMessage('Zu weit vom Truck entfernt', 1.2);
+        }
+    }
+}
+
+function driveUpdate(dt) {
+    // Throttle / brake
+    let throttle = 0;
+    if (keys['KeyW'] || keys['ArrowUp'])   throttle = 1;
+    if (keys['KeyS'] || keys['ArrowDown']) throttle = -1;
+    state.truckSpeed += throttle * 9 * dt;
+    if (throttle === 0) state.truckSpeed *= Math.pow(0.25, dt);
+    state.truckSpeed = Math.max(-10, Math.min(20, state.truckSpeed));
+
+    // Steering (scales with speed, reverses when driving backward)
+    let steer = 0;
+    if (keys['KeyA'] || keys['ArrowLeft'])  steer = 1;
+    if (keys['KeyD'] || keys['ArrowRight']) steer = -1;
+    const speedFrac = Math.min(1, Math.abs(state.truckSpeed) / 20);
+    state.truckYaw += steer * 1.4 * speedFrac * dt * Math.sign(state.truckSpeed || 1);
+
+    // Move truck
+    const fwd = new THREE.Vector3(
+        -Math.sin(state.truckYaw), 0, -Math.cos(state.truckYaw));
+    state.truckPos.addScaledVector(fwd, state.truckSpeed * dt);
+    state.truckPos.x = Math.max(-80, Math.min(80, state.truckPos.x));
+    state.truckPos.z = Math.max(-80, Math.min(80, state.truckPos.z));
+
+    truckGroup.position.copy(state.truckPos);
+    truckGroup.rotation.y = state.truckYaw;
+
+    // Player stays "in" the truck (for hose, air refill, etc.)
+    state.player.pos.copy(state.truckPos);
+    state.player.pos.y = 2.5;
+    state.player.yaw = state.truckYaw;
+
+    // Chase camera - behind and above the truck
+    const back = fwd.clone().negate();
+    const camPos = state.truckPos.clone()
+        .addScaledVector(back, 12)
+        .add(new THREE.Vector3(0, 6.5, 0));
+    camera.position.copy(camPos);
+    const lookPoint = state.truckPos.clone()
+        .addScaledVector(fwd, 6)
+        .add(new THREE.Vector3(0, 2.5, 0));
+    camera.lookAt(lookPoint);
+}
 document.addEventListener('keyup', e => { keys[e.code] = false; });
 
 canvas.addEventListener('click', () => {
@@ -2620,53 +3039,51 @@ function tryInteract() {
 const clock = new THREE.Clock();
 
 function update(dt) {
-    // --- Player movement ---
-    const forward = new THREE.Vector3(
-        -Math.sin(state.player.yaw), 0, -Math.cos(state.player.yaw));
-    const right = new THREE.Vector3(
-        Math.cos(state.player.yaw), 0, -Math.sin(state.player.yaw));
+    let lookDir;
 
-    const move = new THREE.Vector3();
-    if (state.running) {
-        if (keys['KeyW'] || keys['ArrowUp'])    move.add(forward);
-        if (keys['KeyS'] || keys['ArrowDown'])  move.sub(forward);
-        if (keys['KeyD'] || keys['ArrowRight']) move.add(right);
-        if (keys['KeyA'] || keys['ArrowLeft'])  move.sub(right);
-    }
-    if (move.lengthSq() > 0) {
-        move.normalize().multiplyScalar(5.5 * dt);
-        state.player.pos.add(move);
-    }
+    if (state.drivingTruck) {
+        // === DRIVE MODE ===
+        driveUpdate(dt);
+        // Pseudo look direction for the spray/camera/prompt logic that
+        // expects a forward vector; sprays are disabled in drive mode anyway.
+        lookDir = new THREE.Vector3(
+            -Math.sin(state.truckYaw), 0, -Math.cos(state.truckYaw));
+    } else {
+        // === WALK MODE ===
+        const forward = new THREE.Vector3(
+            -Math.sin(state.player.yaw), 0, -Math.cos(state.player.yaw));
+        const right = new THREE.Vector3(
+            Math.cos(state.player.yaw), 0, -Math.sin(state.player.yaw));
 
-    // Clamp to world bounds
-    state.player.pos.x = Math.max(-80, Math.min(80, state.player.pos.x));
-    state.player.pos.z = Math.max(-80, Math.min(80, state.player.pos.z));
-    state.player.pos.y = 1.7;
-
-    // Simple truck body collision (keep player outside the truck box)
-    {
-        const local = state.player.pos.clone().sub(TRUCK_POS);
-        const bxW = 1.75, bxH = 6, bxD = 6.5;
-        if (Math.abs(local.x) < bxW && Math.abs(local.z - 1.0) < bxD) {
-            // push out along the larger penetration axis
-            const dx = bxW - Math.abs(local.x);
-            const dz = bxD - Math.abs(local.z - 1.0);
-            if (dx < dz) {
-                state.player.pos.x = TRUCK_POS.x + Math.sign(local.x || 1) * bxW;
-            } else {
-                state.player.pos.z = TRUCK_POS.z + 1.0 + Math.sign((local.z - 1.0) || 1) * bxD;
-            }
+        const move = new THREE.Vector3();
+        if (state.running) {
+            if (keys['KeyW'] || keys['ArrowUp'])    move.add(forward);
+            if (keys['KeyS'] || keys['ArrowDown'])  move.sub(forward);
+            if (keys['KeyD'] || keys['ArrowRight']) move.add(right);
+            if (keys['KeyA'] || keys['ArrowLeft'])  move.sub(right);
         }
-    }
+        if (move.lengthSq() > 0) {
+            move.normalize().multiplyScalar(5.5 * dt);
+            state.player.pos.add(move);
+        }
 
-    // --- Camera follows player ---
-    camera.position.copy(state.player.pos);
-    const lookDir = new THREE.Vector3(
-        -Math.sin(state.player.yaw) * Math.cos(state.player.pitch),
-        Math.sin(state.player.pitch),
-        -Math.cos(state.player.yaw) * Math.cos(state.player.pitch)
-    );
-    camera.lookAt(state.player.pos.clone().add(lookDir));
+        // Clamp to world bounds
+        state.player.pos.x = Math.max(-80, Math.min(80, state.player.pos.x));
+        state.player.pos.z = Math.max(-80, Math.min(80, state.player.pos.z));
+        state.player.pos.y = 1.7;
+
+        // Interior building collision (walls + door gap)
+        if (interiorHouse) applyInteriorCollision(interiorHouse, state.player.pos);
+
+        // --- Camera follows player ---
+        camera.position.copy(state.player.pos);
+        lookDir = new THREE.Vector3(
+            -Math.sin(state.player.yaw) * Math.cos(state.player.pitch),
+            Math.sin(state.player.pitch),
+            -Math.cos(state.player.yaw) * Math.cos(state.player.pitch)
+        );
+        camera.lookAt(state.player.pos.clone().add(lookDir));
+    }
 
     // --- Compartment animation + proximity ---
     state.nearbyCompartment = null;
@@ -2676,30 +3093,40 @@ function update(dt) {
         c.pivot.rotation.x = c.currentAngle;
 
         c.group.getWorldPosition(c.worldPos);
-        const d = state.player.pos.distanceTo(c.worldPos);
-        if (d < nearestDist) {
-            nearestDist = d;
-            state.nearbyCompartment = c;
+        if (!state.drivingTruck) {
+            const d = state.player.pos.distanceTo(c.worldPos);
+            if (d < nearestDist) {
+                nearestDist = d;
+                state.nearbyCompartment = c;
+            }
         }
     }
 
-    // --- Hydrant proximity ---
+    // --- Hydrant proximity (only walking) ---
     state.nearbyHydrant = null;
-    for (const h of hydrants) {
-        if (state.player.pos.distanceTo(h.position) < 2.5) {
-            state.nearbyHydrant = h;
-            break;
+    if (!state.drivingTruck) {
+        for (const h of hydrants) {
+            if (state.player.pos.distanceTo(h.position) < 2.5) {
+                state.nearbyHydrant = h;
+                break;
+            }
         }
     }
 
     // --- Interaction prompt ---
     const prompt = document.getElementById('interact-prompt');
-    if (state.nearbyCompartment) {
+    if (state.drivingTruck) {
+        prompt.textContent = '[F] Aussteigen';
+        prompt.classList.remove('hidden');
+    } else if (state.nearbyCompartment) {
         prompt.textContent = `[E] ${state.nearbyCompartment.name} ${
             state.nearbyCompartment.isOpen ? 'schließen' : 'öffnen'}`;
         prompt.classList.remove('hidden');
     } else if (state.nearbyHydrant) {
         prompt.textContent = '[E] Wasser auffüllen';
+        prompt.classList.remove('hidden');
+    } else if (state.player.pos.distanceTo(state.truckPos) < 6) {
+        prompt.textContent = '[F] Einsteigen';
         prompt.classList.remove('hidden');
     } else {
         prompt.classList.add('hidden');
@@ -2716,8 +3143,9 @@ function update(dt) {
         hoseEl.classList.add('disconnected');
     }
 
-    // --- Spraying water (only if hose connected) ---
-    if (state.spraying && state.water > 0 && state.running && state.hoseConnected) {
+    // --- Spraying water (only if walking and hose connected) ---
+    if (state.spraying && state.water > 0 && state.running &&
+        state.hoseConnected && !state.drivingTruck) {
         const useRate = state.nozzleMode === 'stream' ? 18 : 32;
         state.water = Math.max(0, state.water - dt * useRate);
         const origin = camera.position.clone().add(lookDir.clone().multiplyScalar(0.8));
