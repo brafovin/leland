@@ -152,6 +152,52 @@ canvas {
     to   { opacity: 0.9; }
 }
 
+/* Mission briefing panel top-center */
+#mission-hud {
+    position: fixed;
+    top: 20px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0, 0, 0, 0.7);
+    border: 2px solid #ffd200;
+    border-radius: 6px;
+    padding: 10px 24px;
+    min-width: 360px;
+    max-width: 520px;
+    text-align: center;
+    z-index: 10;
+    pointer-events: none;
+    backdrop-filter: blur(2px);
+    box-shadow: 0 0 20px rgba(255, 210, 0, 0.3);
+}
+.mission-title {
+    font-size: 11px;
+    letter-spacing: 3px;
+    color: #ffd200;
+    font-weight: bold;
+    margin-bottom: 4px;
+}
+#mission-name {
+    font-size: 20px;
+    font-weight: bold;
+    color: #fff;
+    letter-spacing: 1px;
+    text-shadow: 0 0 8px rgba(255, 210, 0, 0.6);
+    margin-bottom: 3px;
+}
+#mission-objective {
+    font-size: 13px;
+    color: #eee;
+    line-height: 1.4;
+}
+#mission-progress {
+    font-size: 14px;
+    color: #ff9800;
+    font-weight: bold;
+    margin-top: 6px;
+    letter-spacing: 1px;
+}
+
 /* Bottom-center nozzle schematic (hands + nozzle) */
 #nozzle-icon {
     position: fixed;
