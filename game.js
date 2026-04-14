@@ -8,6 +8,8 @@ const state = {
     score: 0,
     water: 100,
     maxWater: 100,
+    air: 100,        // SCBA breathing tank (depletes in smoke)
+    maxAir: 100,
     lives: 3,
     level: 1,
     fires: [],
@@ -18,10 +20,26 @@ const state = {
         pitch: -0.05,
     },
     spraying: false,
+    nozzleMode: 'stream',   // 'stream' (long range, high damage) or 'fog' (cone, low damage)
+    hoseConnected: true,
+    smokeIntensity: 0,      // 0..1, increases near fires, darkens vision
     nearbyCompartment: null,
     nearbyHydrant: null,
     running: false,
     levelTransitioning: false,
+};
+
+// Simulator constants
+const SIM = {
+    HOSE_MAX_LENGTH: 32,             // meters from truck pump outlet
+    AIR_DEPLETE_PER_SEC: 4,          // when standing in smoke
+    AIR_REFILL_RATE: 40,             // when at hydrant/truck
+    FIRE_GROW_PER_SEC: 3,            // fire health points added per second (if not being hit)
+    FIRE_MAX_HEALTH: 260,            // cap so it's still beatable
+    STREAM_DAMAGE: 14,               // per particle hit
+    FOG_DAMAGE: 6,                   // per particle hit (but fog shoots many)
+    SMOKE_RADIUS: 10,                // fires pump smoke in this radius
+    TRUCK_OUTLET: new THREE.Vector3(1.31, 1.25, 4.0), // local pos of rear pump outlet
 };
 
 const keys = {};
@@ -781,6 +799,63 @@ function addTruckDetails() {
 addTruckDetails();
 
 // ============================================================
+// DEPLOYABLE HOSE (visible line from truck pump outlet to player)
+// ============================================================
+const HOSE_SEGMENTS = 28;
+const hoseLine = (() => {
+    const positions = new Float32Array((HOSE_SEGMENTS + 1) * 3);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    const mat = new THREE.LineBasicMaterial({ color: 0xe8d8b8, linewidth: 2 });
+    const line = new THREE.Line(geo, mat);
+    line.frustumCulled = false;
+    scene.add(line);
+    return line;
+})();
+
+// World-space outlet is the local SIM.TRUCK_OUTLET transformed by the truck
+const _outletWorld = new THREE.Vector3();
+function getHoseOutlet() {
+    _outletWorld.copy(SIM.TRUCK_OUTLET);
+    truckGroup.localToWorld(_outletWorld);
+    return _outletWorld;
+}
+
+// Update the hose line as a catenary (sagging) curve from outlet to player hand
+function updateHose() {
+    const outlet = getHoseOutlet();
+    const hand = state.player.pos.clone();
+    hand.y -= 0.3;
+    // bring hand slightly forward of the player so the hose appears to be held
+    const forward = new THREE.Vector3(
+        -Math.sin(state.player.yaw), 0, -Math.cos(state.player.yaw));
+    hand.addScaledVector(forward, 0.4);
+
+    const dist = outlet.distanceTo(hand);
+    state.hoseConnected = dist <= SIM.HOSE_MAX_LENGTH;
+
+    // Drop amount based on distance - longer hose sags more
+    const sag = Math.min(2.0, dist * 0.08);
+
+    const pos = hoseLine.geometry.attributes.position.array;
+    for (let i = 0; i <= HOSE_SEGMENTS; i++) {
+        const t = i / HOSE_SEGMENTS;
+        // Lerp between outlet and hand
+        const x = outlet.x + (hand.x - outlet.x) * t;
+        const z = outlet.z + (hand.z - outlet.z) * t;
+        let y = outlet.y + (hand.y - outlet.y) * t;
+        // Catenary-ish sag (sin curve is a decent approximation for this length)
+        y -= Math.sin(t * Math.PI) * sag;
+        const idx = i * 3;
+        pos[idx]     = x;
+        pos[idx + 1] = y;
+        pos[idx + 2] = z;
+    }
+    hoseLine.geometry.attributes.position.needsUpdate = true;
+    hoseLine.geometry.computeBoundingSphere();
+}
+
+// ============================================================
 // EQUIPMENT (items stored inside compartments)
 // ============================================================
 function createEquipment(type) {
@@ -1268,6 +1343,9 @@ function createFire(x, z) {
         light,
         scorch,
         health: 100,
+        maxHealth: 100,
+        growScale: 1.0,           // grows with time, shrinks as fire is damaged
+        lastHitTime: 0,
         position: new THREE.Vector3(x, 0, z),
         extinguished: false,
     };
@@ -1304,18 +1382,43 @@ const waterMat = new THREE.MeshBasicMaterial({
 });
 
 function spawnWaterParticles(origin, dir) {
-    for (let i = 0; i < 4; i++) {
-        const p = new THREE.Mesh(waterGeo, waterMat.clone());
-        p.position.copy(origin);
-        const spread = new THREE.Vector3(
-            (Math.random() - 0.5) * 0.25,
-            (Math.random() - 0.5) * 0.25,
-            (Math.random() - 0.5) * 0.25
-        );
-        p.userData.vel = dir.clone().multiplyScalar(16).add(spread.multiplyScalar(5));
-        p.userData.life = 1.0;
-        scene.add(p);
-        waterParticles.push(p);
+    if (state.nozzleMode === 'stream') {
+        // Tight, fast, long-range stream with heavy damage per particle
+        for (let i = 0; i < 3; i++) {
+            const p = new THREE.Mesh(waterGeo, waterMat.clone());
+            p.position.copy(origin);
+            const spread = new THREE.Vector3(
+                (Math.random() - 0.5) * 0.1,
+                (Math.random() - 0.5) * 0.1,
+                (Math.random() - 0.5) * 0.1
+            );
+            p.userData.vel = dir.clone().multiplyScalar(26).add(spread.multiplyScalar(3));
+            p.userData.life = 1.2;
+            p.userData.damage = SIM.STREAM_DAMAGE;
+            scene.add(p);
+            waterParticles.push(p);
+        }
+    } else {
+        // Wide fog cone with lots of small droplets, low damage per droplet
+        for (let i = 0; i < 10; i++) {
+            const p = new THREE.Mesh(waterGeo, waterMat.clone());
+            p.position.copy(origin);
+            // Random direction within a cone
+            const coneAngle = 0.35;
+            const theta = Math.random() * Math.PI * 2;
+            const r = Math.random() * coneAngle;
+            const right = new THREE.Vector3(-dir.z, 0, dir.x).normalize();
+            const up = new THREE.Vector3().crossVectors(dir, right).normalize();
+            const coneDir = dir.clone()
+                .addScaledVector(right, Math.sin(r) * Math.cos(theta))
+                .addScaledVector(up,    Math.sin(r) * Math.sin(theta))
+                .normalize();
+            p.userData.vel = coneDir.multiplyScalar(14 + Math.random() * 4);
+            p.userData.life = 0.7;
+            p.userData.damage = SIM.FOG_DAMAGE;
+            scene.add(p);
+            waterParticles.push(p);
+        }
     }
 }
 
@@ -1330,8 +1433,10 @@ function updateWaterParticles(dt) {
         // Collide with any active fire
         for (const fire of state.fires) {
             if (fire.extinguished) continue;
-            if (p.position.distanceTo(fire.position) < 1.4 && p.position.y < 2.5) {
-                fire.health -= 12;
+            const hitRadius = 1.2 + fire.growScale * 0.4;
+            if (p.position.distanceTo(fire.position) < hitRadius && p.position.y < 3.0) {
+                fire.health -= (p.userData.damage || 12);
+                fire.lastHitTime = performance.now() / 1000;
                 p.userData.life = 0;
                 if (fire.health <= 0) {
                     fire.extinguished = true;
@@ -1358,6 +1463,16 @@ function updateWaterParticles(dt) {
 document.addEventListener('keydown', e => {
     keys[e.code] = true;
     if (e.code === 'KeyE') tryInteract();
+    if (e.code === 'Digit1') {
+        state.nozzleMode = 'stream';
+        updateHUD();
+        showMessage('Vollstrahl', 1);
+    }
+    if (e.code === 'Digit2') {
+        state.nozzleMode = 'fog';
+        updateHUD();
+        showMessage('Sprühnebel', 1);
+    }
 });
 document.addEventListener('keyup', e => { keys[e.code] = false; });
 
@@ -1398,8 +1513,9 @@ function tryInteract() {
     }
     if (state.nearbyHydrant) {
         state.water = state.maxWater;
+        state.air = state.maxAir;
         updateHUD();
-        showMessage('Wasser aufgefüllt!', 1.5);
+        showMessage('Wasser & Atemluft aufgefüllt!', 1.5);
     }
 }
 
@@ -1494,9 +1610,21 @@ function update(dt) {
         prompt.classList.add('hidden');
     }
 
-    // --- Spraying water ---
-    if (state.spraying && state.water > 0 && state.running) {
-        state.water = Math.max(0, state.water - dt * 25);
+    // --- Hose line update (visible sagging tube from truck to player) ---
+    updateHose();
+    const hoseEl = document.getElementById('hose-status');
+    if (state.hoseConnected) {
+        hoseEl.textContent = 'CONNECTED';
+        hoseEl.classList.remove('disconnected');
+    } else {
+        hoseEl.textContent = 'OUT OF RANGE';
+        hoseEl.classList.add('disconnected');
+    }
+
+    // --- Spraying water (only if hose connected) ---
+    if (state.spraying && state.water > 0 && state.running && state.hoseConnected) {
+        const useRate = state.nozzleMode === 'stream' ? 18 : 32;
+        state.water = Math.max(0, state.water - dt * useRate);
         const origin = camera.position.clone().add(lookDir.clone().multiplyScalar(0.8));
         origin.y -= 0.25;
         spawnWaterParticles(origin, lookDir);
@@ -1504,6 +1632,80 @@ function update(dt) {
     }
 
     updateWaterParticles(dt);
+
+    // --- Smoke intensity (distance to nearest unextinguished fire) ---
+    let nearestFireDist = Infinity;
+    let activeFires = 0;
+    for (const fire of state.fires) {
+        if (fire.extinguished) continue;
+        activeFires++;
+        const d = state.player.pos.distanceTo(fire.position);
+        if (d < nearestFireDist) nearestFireDist = d;
+    }
+    // Smoke is thick within SMOKE_RADIUS and fades to 0 at 2x radius
+    let targetSmoke = 0;
+    if (nearestFireDist < SIM.SMOKE_RADIUS * 2) {
+        targetSmoke = Math.max(0,
+            1 - (nearestFireDist - SIM.SMOKE_RADIUS * 0.3) /
+                (SIM.SMOKE_RADIUS * 1.4));
+        targetSmoke = Math.min(1, targetSmoke);
+    }
+    state.smokeIntensity += (targetSmoke - state.smokeIntensity) * Math.min(1, dt * 3);
+
+    // Adjust fog + tone exposure to sell the smoke
+    scene.fog.color.setRGB(
+        0.75 - state.smokeIntensity * 0.6,
+        0.85 - state.smokeIntensity * 0.7,
+        0.94 - state.smokeIntensity * 0.8
+    );
+    scene.fog.near = 80 - state.smokeIntensity * 70;
+    scene.fog.far  = 300 - state.smokeIntensity * 270;
+    renderer.toneMappingExposure = 1.05 - state.smokeIntensity * 0.4;
+
+    // --- SCBA air depletion in smoke / refill at hydrant or truck ---
+    if (state.running) {
+        const outlet = getHoseOutlet();
+        const atTruck = state.player.pos.distanceTo(outlet) < 3.5;
+        if (state.nearbyHydrant || atTruck) {
+            state.air = Math.min(state.maxAir, state.air + dt * SIM.AIR_REFILL_RATE);
+        } else if (state.smokeIntensity > 0.2) {
+            state.air = Math.max(0,
+                state.air - dt * SIM.AIR_DEPLETE_PER_SEC * state.smokeIntensity);
+        }
+        if (state.air <= 0 && state.smokeIntensity > 0.4) {
+            // Suffocation hit - lose a life, respawn at truck
+            state.lives = Math.max(0, state.lives - 1);
+            state.air = state.maxAir * 0.5;
+            state.player.pos.set(10, 1.7, 12);
+            showMessage('Keine Luft mehr! Du wurdest evakuiert.', 3);
+            updateHUD();
+        }
+        updateHUD();
+    }
+
+    // Low-air warning flash
+    const warningEl = document.getElementById('warning-overlay');
+    if (state.air < 25 && state.smokeIntensity > 0.3) {
+        warningEl.classList.remove('hidden');
+    } else {
+        warningEl.classList.add('hidden');
+    }
+
+    // --- Fire growth: if a fire isn't hit recently, it grows ---
+    const now = performance.now() / 1000;
+    for (const fire of state.fires) {
+        if (fire.extinguished) continue;
+        const sinceHit = now - (fire.lastHitTime || 0);
+        if (sinceHit > 1.5 && fire.health < SIM.FIRE_MAX_HEALTH) {
+            fire.health = Math.min(
+                SIM.FIRE_MAX_HEALTH,
+                fire.health + SIM.FIRE_GROW_PER_SEC * dt);
+        }
+        // growScale reflects how big the fire is (0.5 small ... 1.8 raging)
+        const targetScale = 0.5 + (fire.health / SIM.FIRE_MAX_HEALTH) * 1.3;
+        fire.growScale += (targetScale - fire.growScale) * Math.min(1, dt * 2);
+        fire.group.scale.setScalar(fire.growScale);
+    }
 
     // --- Flame animation (billboard sprites) ---
     const t = clock.getElapsedTime();
@@ -1583,9 +1785,15 @@ animate();
 // ============================================================
 function updateHUD() {
     document.getElementById('score').textContent = state.score;
-    document.getElementById('lives').textContent = state.lives;
     document.getElementById('level').textContent = state.level;
+    const activeFires = state.fires.filter(f => !f.extinguished).length;
+    document.getElementById('fires-left').textContent = activeFires;
     document.getElementById('water-fill').style.width = (state.water / state.maxWater * 100) + '%';
+    document.getElementById('air-fill').style.width = (state.air / state.maxAir * 100) + '%';
+    document.getElementById('nozzle-mode').textContent =
+        state.nozzleMode === 'stream' ? 'VOLLSTRAHL' : 'SPRÜHNEBEL';
+    const pat = document.getElementById('nozzle-pattern');
+    if (pat) pat.className = 'nozzle-pattern' + (state.nozzleMode === 'fog' ? ' fog' : '');
 }
 
 function showMessage(text, duration) {
