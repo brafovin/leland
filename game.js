@@ -8,6 +8,8 @@ const state = {
     score: 0,
     water: 100,
     maxWater: 100,
+    air: 100,        // SCBA breathing tank (depletes in smoke)
+    maxAir: 100,
     lives: 3,
     level: 1,
     fires: [],
@@ -18,10 +20,26 @@ const state = {
         pitch: -0.05,
     },
     spraying: false,
+    nozzleMode: 'stream',   // 'stream' (long range, high damage) or 'fog' (cone, low damage)
+    hoseConnected: true,
+    smokeIntensity: 0,      // 0..1, increases near fires, darkens vision
     nearbyCompartment: null,
     nearbyHydrant: null,
     running: false,
     levelTransitioning: false,
+};
+
+// Simulator constants
+const SIM = {
+    HOSE_MAX_LENGTH: 32,             // meters from truck pump outlet
+    AIR_DEPLETE_PER_SEC: 4,          // when standing in smoke
+    AIR_REFILL_RATE: 40,             // when at hydrant/truck
+    FIRE_GROW_PER_SEC: 3,            // fire health points added per second (if not being hit)
+    FIRE_MAX_HEALTH: 260,            // cap so it's still beatable
+    STREAM_DAMAGE: 14,               // per particle hit
+    FOG_DAMAGE: 6,                   // per particle hit (but fog shoots many)
+    SMOKE_RADIUS: 10,                // fires pump smoke in this radius
+    TRUCK_OUTLET: new THREE.Vector3(1.31, 1.25, 4.0), // local pos of rear pump outlet
 };
 
 const keys = {};
@@ -36,6 +54,9 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.outputEncoding = THREE.sRGBEncoding;
+renderer.physicallyCorrectLights = true;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
 document.getElementById('canvas-container').appendChild(renderer.domElement);
 const canvas = renderer.domElement;
 
@@ -43,10 +64,9 @@ const canvas = renderer.domElement;
 // SCENE + CAMERA
 // ============================================================
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x87ceeb);
-scene.fog = new THREE.Fog(0x9ec5e8, 60, 240);
+scene.fog = new THREE.Fog(0xbfd9f0, 80, 300);
 
-const camera = new THREE.PerspectiveCamera(75, 1, 0.1, 500);
+const camera = new THREE.PerspectiveCamera(70, 1, 0.1, 2000);
 
 function resize() {
     const w = window.innerWidth;
@@ -59,39 +79,247 @@ window.addEventListener('resize', resize);
 resize();
 
 // ============================================================
-// LIGHTING
+// SKY (Three.js Sky shader - procedural atmospheric scattering)
 // ============================================================
-scene.add(new THREE.AmbientLight(0xffffff, 0.55));
-scene.add(new THREE.HemisphereLight(0x87ceeb, 0x3a2a1a, 0.4));
+const sky = new THREE.Sky();
+sky.scale.setScalar(10000);
+scene.add(sky);
+const skyU = sky.material.uniforms;
+skyU['turbidity'].value = 6;
+skyU['rayleigh'].value = 1.5;
+skyU['mieCoefficient'].value = 0.005;
+skyU['mieDirectionalG'].value = 0.82;
 
-const sun = new THREE.DirectionalLight(0xfff3d6, 1.0);
-sun.position.set(60, 90, 30);
+// Sun position (shared between Sky shader and DirectionalLight)
+const sunPos = new THREE.Vector3();
+{
+    const elevation = 42; // degrees above horizon
+    const azimuth = 135;
+    const phi = THREE.MathUtils.degToRad(90 - elevation);
+    const theta = THREE.MathUtils.degToRad(azimuth);
+    sunPos.setFromSphericalCoords(1, phi, theta);
+    skyU['sunPosition'].value.copy(sunPos);
+}
+
+// ============================================================
+// LIGHTING (physically correct units - lux/cd)
+// ============================================================
+scene.add(new THREE.AmbientLight(0xffffff, 0.12));
+
+const sun = new THREE.DirectionalLight(0xfff4d6, 3.2);
+sun.position.copy(sunPos).multiplyScalar(150);
 sun.castShadow = true;
 sun.shadow.camera.left = -80;
 sun.shadow.camera.right = 80;
 sun.shadow.camera.top = 80;
 sun.shadow.camera.bottom = -80;
 sun.shadow.camera.near = 1;
-sun.shadow.camera.far = 250;
+sun.shadow.camera.far = 400;
 sun.shadow.mapSize.set(2048, 2048);
-sun.shadow.bias = -0.0005;
+sun.shadow.bias = -0.0003;
+sun.shadow.normalBias = 0.02;
 scene.add(sun);
 
 // ============================================================
-// SHARED MATERIALS
+// ENVIRONMENT MAP (PMREM from Sky shader)
+// Bakes the sky into an IBL cube so all PBR materials get realistic
+// indirect lighting + reflections. Must be done before any other
+// geometry is added so only the sky ends up in the environment.
+// ============================================================
+{
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    pmrem.compileEquirectangularShader();
+    scene.environment = pmrem.fromScene(scene, 0.04).texture;
+    pmrem.dispose();
+}
+
+// ============================================================
+// SHARED MATERIALS (physical, clearcoat paint for realism)
 // ============================================================
 const MAT = {
-    red: new THREE.MeshStandardMaterial({ color: 0xc41230, metalness: 0.5, roughness: 0.35 }),
-    white: new THREE.MeshStandardMaterial({ color: 0xf5f5f5, metalness: 0.4, roughness: 0.4 }),
-    chrome: new THREE.MeshStandardMaterial({ color: 0xdddddd, metalness: 0.95, roughness: 0.1 }),
-    black: new THREE.MeshStandardMaterial({ color: 0x121212, roughness: 0.6 }),
-    glass: new THREE.MeshStandardMaterial({ color: 0x668899, metalness: 0.3, roughness: 0.05, transparent: true, opacity: 0.55 }),
-    yellow: new THREE.MeshStandardMaterial({ color: 0xffd200, metalness: 0.3, roughness: 0.5 }),
+    // Candy-apple red fire truck paint with clearcoat (simulates 2K lacquer)
+    red: new THREE.MeshPhysicalMaterial({
+        color: 0xb00e26,
+        metalness: 0.2,
+        roughness: 0.32,
+        clearcoat: 1.0,
+        clearcoatRoughness: 0.08,
+        reflectivity: 0.6,
+    }),
+    // Off-white cab roof / door paint, same clearcoat
+    white: new THREE.MeshPhysicalMaterial({
+        color: 0xeeeeee,
+        metalness: 0.15,
+        roughness: 0.35,
+        clearcoat: 0.9,
+        clearcoatRoughness: 0.1,
+    }),
+    // Chrome bumper, handles, rims - heavily reflective
+    chrome: new THREE.MeshPhysicalMaterial({
+        color: 0xf0f0f0,
+        metalness: 1.0,
+        roughness: 0.06,
+        clearcoat: 0.5,
+        clearcoatRoughness: 0.05,
+    }),
+    // Smoked glass for windshield/side windows
+    glass: new THREE.MeshPhysicalMaterial({
+        color: 0x182028,
+        metalness: 0.2,
+        roughness: 0.04,
+        transmission: 0.4,
+        transparent: true,
+        opacity: 0.55,
+        clearcoat: 1.0,
+        clearcoatRoughness: 0.02,
+        ior: 1.45,
+    }),
+    // Painted black chassis / trim
+    black: new THREE.MeshPhysicalMaterial({
+        color: 0x0c0c0c,
+        metalness: 0.4,
+        roughness: 0.55,
+        clearcoat: 0.4,
+        clearcoatRoughness: 0.3,
+    }),
+    // Hydrant / scotchlite stripe yellow
+    yellow: new THREE.MeshPhysicalMaterial({
+        color: 0xf4c20d,
+        metalness: 0.3,
+        roughness: 0.45,
+        clearcoat: 0.6,
+        clearcoatRoughness: 0.2,
+    }),
+    // Hickory axe handle
     wood: new THREE.MeshStandardMaterial({ color: 0x6b4226, roughness: 0.9 }),
-    asphalt: new THREE.MeshStandardMaterial({ color: 0x363636, roughness: 0.95 }),
-    brick: new THREE.MeshStandardMaterial({ color: 0x9a3a2c, roughness: 0.9 }),
-    interior: new THREE.MeshStandardMaterial({ color: 0x1a1a1a, roughness: 0.9 }),
+    // Asphalt (texture applied later in GROUND section)
+    asphalt: new THREE.MeshStandardMaterial({ color: 0x2a2a2a, roughness: 0.95, metalness: 0 }),
+    // Brick (texture applied later in FIRE STATION section)
+    brick: new THREE.MeshStandardMaterial({ color: 0x8a3423, roughness: 0.92, metalness: 0 }),
+    // Dark compartment interior
+    interior: new THREE.MeshStandardMaterial({ color: 0x141414, roughness: 0.95 }),
+    // Rubber tire
+    rubber: new THREE.MeshStandardMaterial({ color: 0x0b0b0b, roughness: 0.88, metalness: 0 }),
 };
+
+// ============================================================
+// CANVAS TEXTURES (procedural, no external assets)
+// ============================================================
+function makeAsphaltTexture() {
+    const size = 512;
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const ctx = c.getContext('2d');
+    // Base
+    ctx.fillStyle = '#2b2b2b';
+    ctx.fillRect(0, 0, size, size);
+    // Noise grain
+    for (let i = 0; i < 12000; i++) {
+        const x = Math.random() * size;
+        const y = Math.random() * size;
+        const r = Math.random() * 1.8;
+        const g = 25 + Math.random() * 90;
+        ctx.fillStyle = `rgb(${g},${g},${g})`;
+        ctx.fillRect(x, y, r, r);
+    }
+    // Larger aggregate stones
+    for (let i = 0; i < 300; i++) {
+        const x = Math.random() * size;
+        const y = Math.random() * size;
+        const r = 1 + Math.random() * 2.5;
+        const g = 55 + Math.random() * 50;
+        ctx.fillStyle = `rgb(${g},${g},${g})`;
+        ctx.beginPath();
+        ctx.arc(x, y, r, 0, Math.PI * 2);
+        ctx.fill();
+    }
+    // Oil stain blotches
+    for (let i = 0; i < 20; i++) {
+        const x = Math.random() * size;
+        const y = Math.random() * size;
+        const r = 6 + Math.random() * 14;
+        const grd = ctx.createRadialGradient(x, y, 0, x, y, r);
+        grd.addColorStop(0, 'rgba(0,0,0,0.5)');
+        grd.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = grd;
+        ctx.fillRect(x - r, y - r, r * 2, r * 2);
+    }
+    const tex = new THREE.CanvasTexture(c);
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.encoding = THREE.sRGBEncoding;
+    return tex;
+}
+
+function makeBrickTexture() {
+    const w = 512, h = 512;
+    const c = document.createElement('canvas');
+    c.width = w; c.height = h;
+    const ctx = c.getContext('2d');
+    // Mortar background
+    ctx.fillStyle = '#3a2a22';
+    ctx.fillRect(0, 0, w, h);
+    // Bricks
+    const bw = 64, bh = 26, mortar = 3;
+    for (let row = 0; row < h / bh; row++) {
+        const offset = (row % 2) * (bw / 2);
+        for (let col = -1; col < w / bw + 1; col++) {
+            const x = col * bw + offset;
+            const y = row * bh;
+            const shade = 0.72 + Math.random() * 0.42;
+            const r = Math.floor(138 * shade);
+            const g = Math.floor(50 * shade);
+            const b = Math.floor(38 * shade);
+            ctx.fillStyle = `rgb(${r},${g},${b})`;
+            ctx.fillRect(x + mortar / 2, y + mortar / 2, bw - mortar, bh - mortar);
+            // Subtle speckles for aged look
+            for (let k = 0; k < 6; k++) {
+                ctx.fillStyle = `rgba(0,0,0,${Math.random() * 0.18})`;
+                ctx.fillRect(
+                    x + mortar / 2 + Math.random() * (bw - mortar),
+                    y + mortar / 2 + Math.random() * (bh - mortar),
+                    2, 2);
+            }
+        }
+    }
+    const tex = new THREE.CanvasTexture(c);
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.encoding = THREE.sRGBEncoding;
+    return tex;
+}
+
+function makeConcreteTexture() {
+    const size = 256;
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#9e9a90';
+    ctx.fillRect(0, 0, size, size);
+    for (let i = 0; i < 4000; i++) {
+        const x = Math.random() * size, y = Math.random() * size;
+        const shade = 130 + Math.random() * 70;
+        ctx.fillStyle = `rgba(${shade},${shade - 5},${shade - 10},${Math.random() * 0.8})`;
+        ctx.fillRect(x, y, 1.5, 1.5);
+    }
+    const tex = new THREE.CanvasTexture(c);
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.encoding = THREE.sRGBEncoding;
+    return tex;
+}
+
+const TEX = {
+    asphalt: makeAsphaltTexture(),
+    brick: makeBrickTexture(),
+    concrete: makeConcreteTexture(),
+};
+TEX.asphalt.repeat.set(50, 50);
+TEX.brick.repeat.set(4, 2);
+TEX.concrete.repeat.set(8, 4);
+
+// Apply textures to shared materials
+MAT.asphalt.map = TEX.asphalt;
+MAT.asphalt.needsUpdate = true;
+MAT.brick.map = TEX.brick;
+MAT.brick.needsUpdate = true;
 
 // ============================================================
 // GROUND + ROAD MARKINGS
@@ -102,7 +330,20 @@ const MAT = {
     ground.receiveShadow = true;
     scene.add(ground);
 
-    const dashMat = new THREE.MeshBasicMaterial({ color: 0xffd200 });
+    // Concrete apron in front of the fire station bays (lighter strip)
+    const apron = new THREE.Mesh(
+        new THREE.PlaneGeometry(34, 14),
+        new THREE.MeshStandardMaterial({
+            map: TEX.concrete, color: 0xaaa59a, roughness: 0.9, metalness: 0
+        })
+    );
+    apron.rotation.x = -Math.PI / 2;
+    apron.position.set(0, 0.01, -10);
+    apron.receiveShadow = true;
+    scene.add(apron);
+
+    // Yellow lane dashes down the road
+    const dashMat = new THREE.MeshBasicMaterial({ color: 0xf4c20d });
     for (let i = -10; i <= 10; i++) {
         for (const x of [-22, 22]) {
             const line = new THREE.Mesh(new THREE.PlaneGeometry(0.35, 3), dashMat);
@@ -110,6 +351,14 @@ const MAT = {
             line.position.set(x, 0.02, i * 6);
             scene.add(line);
         }
+    }
+
+    // Solid white curbs between apron and road
+    const curbMat = new THREE.MeshStandardMaterial({ color: 0xcccccc, roughness: 0.7 });
+    for (const x of [-17, 17]) {
+        const curb = new THREE.Mesh(new THREE.BoxGeometry(0.4, 0.2, 14), curbMat);
+        curb.position.set(x, 0.1, -10);
+        scene.add(curb);
     }
 }
 
@@ -371,6 +620,240 @@ function buildFireTruck() {
     }
 }
 buildFireTruck();
+
+// ============================================================
+// TRUCK DETAILS (mirrors, grille, pump panel, plate, reflectors)
+// ============================================================
+function addTruckDetails() {
+    // Chrome grille on the front of the cab
+    {
+        const grille = new THREE.Group();
+        const grilleBg = new THREE.Mesh(
+            new THREE.BoxGeometry(2.0, 0.8, 0.06), MAT.black);
+        grille.add(grilleBg);
+        for (let i = -4; i <= 4; i++) {
+            const slot = new THREE.Mesh(
+                new THREE.BoxGeometry(0.12, 0.7, 0.1), MAT.chrome);
+            slot.position.set(i * 0.22, 0, 0.04);
+            grille.add(slot);
+        }
+        // Thick chrome surround
+        const top = new THREE.Mesh(new THREE.BoxGeometry(2.1, 0.08, 0.12), MAT.chrome);
+        top.position.y = 0.44; grille.add(top);
+        const bot = top.clone(); bot.position.y = -0.44; grille.add(bot);
+        const left = new THREE.Mesh(new THREE.BoxGeometry(0.08, 0.96, 0.12), MAT.chrome);
+        left.position.x = -1.05; grille.add(left);
+        const right = left.clone(); right.position.x = 1.05; grille.add(right);
+
+        grille.position.set(0, 1.55, -4.97);
+        truckGroup.add(grille);
+    }
+
+    // Side mirrors on west-coast style arms
+    for (const sx of [-1.4, 1.4]) {
+        const arm = new THREE.Mesh(
+            new THREE.CylinderGeometry(0.03, 0.03, 0.9, 8), MAT.chrome);
+        arm.rotation.z = Math.PI / 2;
+        arm.position.set(sx + Math.sign(sx) * 0.35, 3.1, -4.5);
+        truckGroup.add(arm);
+
+        const head = new THREE.Mesh(
+            new THREE.BoxGeometry(0.18, 0.45, 0.25), MAT.black);
+        head.position.set(sx + Math.sign(sx) * 0.75, 3.1, -4.5);
+        truckGroup.add(head);
+
+        const mirror = new THREE.Mesh(
+            new THREE.PlaneGeometry(0.38, 0.2),
+            new THREE.MeshPhysicalMaterial({
+                color: 0xbbccdd, metalness: 1, roughness: 0.02,
+                clearcoat: 1, clearcoatRoughness: 0.02,
+            })
+        );
+        mirror.position.set(sx + Math.sign(sx) * (0.75 - 0.13), 3.1, -4.5);
+        mirror.rotation.y = Math.sign(sx) * Math.PI / 2;
+        truckGroup.add(mirror);
+    }
+
+    // Pump panel on driver side - gauges and valves between wheels
+    {
+        const panel = new THREE.Group();
+        const bg = new THREE.Mesh(new THREE.BoxGeometry(1.9, 1.1, 0.08), MAT.chrome);
+        panel.add(bg);
+
+        // Gauges (circles with colored centers)
+        for (let i = 0; i < 5; i++) {
+            const g = new THREE.Mesh(
+                new THREE.CylinderGeometry(0.11, 0.11, 0.04, 16),
+                new THREE.MeshPhysicalMaterial({
+                    color: 0xffffff, metalness: 0, roughness: 0.2,
+                    clearcoat: 1, clearcoatRoughness: 0.02,
+                })
+            );
+            g.rotation.x = Math.PI / 2;
+            g.position.set(-0.7 + i * 0.35, 0.3, 0.05);
+            panel.add(g);
+
+            // Needle
+            const n = new THREE.Mesh(
+                new THREE.BoxGeometry(0.007, 0.08, 0.01),
+                new THREE.MeshBasicMaterial({ color: 0xcc0000 }));
+            n.position.set(-0.7 + i * 0.35, 0.3, 0.09);
+            n.rotation.z = -0.6 + Math.random() * 1.2;
+            panel.add(n);
+        }
+
+        // Valve handles (colored knobs)
+        const valveCols = [0xff0000, 0x0077cc, 0xf4c20d, 0x00aa44];
+        for (let i = 0; i < 4; i++) {
+            const v = new THREE.Mesh(
+                new THREE.CylinderGeometry(0.06, 0.06, 0.05, 12),
+                new THREE.MeshStandardMaterial({ color: valveCols[i], roughness: 0.4 })
+            );
+            v.rotation.x = Math.PI / 2;
+            v.position.set(-0.6 + i * 0.4, -0.25, 0.06);
+            panel.add(v);
+
+            const stem = new THREE.Mesh(
+                new THREE.CylinderGeometry(0.012, 0.012, 0.08, 6), MAT.chrome);
+            stem.position.set(-0.6 + i * 0.4, -0.25, 0.08);
+            panel.add(stem);
+        }
+
+        panel.position.set(-1.33, 1.25, -1.5);
+        panel.rotation.y = Math.PI / 2;
+        truckGroup.add(panel);
+    }
+
+    // License plate at the rear
+    {
+        const plateCanvas = document.createElement('canvas');
+        plateCanvas.width = 256; plateCanvas.height = 128;
+        const px = plateCanvas.getContext('2d');
+        px.fillStyle = '#ffffff';
+        px.fillRect(0, 0, 256, 128);
+        px.fillStyle = '#c41230';
+        px.fillRect(4, 4, 248, 30);
+        px.fillStyle = '#ffffff';
+        px.font = 'bold 22px sans-serif';
+        px.textAlign = 'center';
+        px.fillText('FIRE DEPT', 128, 26);
+        px.fillStyle = '#000';
+        px.font = 'bold 62px "Arial Black", sans-serif';
+        px.fillText('ENG-7', 128, 100);
+        const tex = new THREE.CanvasTexture(plateCanvas);
+        tex.encoding = THREE.sRGBEncoding;
+        const plate = new THREE.Mesh(
+            new THREE.PlaneGeometry(0.9, 0.45),
+            new THREE.MeshStandardMaterial({ map: tex, roughness: 0.4 })
+        );
+        plate.position.set(0, 1.5, 4.76);
+        plate.rotation.y = Math.PI;
+        truckGroup.add(plate);
+
+        // Rear red tail lights
+        for (const sx of [-1.0, 1.0]) {
+            const tl = new THREE.Mesh(
+                new THREE.BoxGeometry(0.35, 0.2, 0.08),
+                new THREE.MeshStandardMaterial({
+                    color: 0xcc0000, emissive: 0xcc0000, emissiveIntensity: 0.9
+                })
+            );
+            tl.position.set(sx, 1.5, 4.76);
+            truckGroup.add(tl);
+        }
+    }
+
+    // Scotchlite chevron pattern on rear (alert stripes)
+    {
+        const chevron = new THREE.Group();
+        const chevW = 0.3, chevH = 2.2;
+        for (let i = -3; i <= 3; i++) {
+            const bar = new THREE.Mesh(
+                new THREE.BoxGeometry(chevW, chevH, 0.04),
+                new THREE.MeshStandardMaterial({
+                    color: i % 2 === 0 ? 0xff3300 : 0xf4c20d,
+                    emissive: i % 2 === 0 ? 0x220800 : 0x221a00,
+                    emissiveIntensity: 0.2,
+                    roughness: 0.4,
+                })
+            );
+            bar.position.set(i * 0.32, 1.5, 4.74);
+            bar.rotation.z = Math.PI / 6;
+            chevron.add(bar);
+        }
+        truckGroup.add(chevron);
+    }
+
+    // Orange cab roof marker lights (5 small amber domes, classic US rig)
+    for (let i = -2; i <= 2; i++) {
+        const marker = new THREE.Mesh(
+            new THREE.SphereGeometry(0.05, 8, 6),
+            new THREE.MeshStandardMaterial({
+                color: 0xffaa00, emissive: 0xffaa00, emissiveIntensity: 1.2
+            })
+        );
+        marker.position.set(i * 0.4, 3.72, -5.0);
+        truckGroup.add(marker);
+    }
+}
+addTruckDetails();
+
+// ============================================================
+// DEPLOYABLE HOSE (visible line from truck pump outlet to player)
+// ============================================================
+const HOSE_SEGMENTS = 28;
+const hoseLine = (() => {
+    const positions = new Float32Array((HOSE_SEGMENTS + 1) * 3);
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    const mat = new THREE.LineBasicMaterial({ color: 0xe8d8b8, linewidth: 2 });
+    const line = new THREE.Line(geo, mat);
+    line.frustumCulled = false;
+    scene.add(line);
+    return line;
+})();
+
+// World-space outlet is the local SIM.TRUCK_OUTLET transformed by the truck
+const _outletWorld = new THREE.Vector3();
+function getHoseOutlet() {
+    _outletWorld.copy(SIM.TRUCK_OUTLET);
+    truckGroup.localToWorld(_outletWorld);
+    return _outletWorld;
+}
+
+// Update the hose line as a catenary (sagging) curve from outlet to player hand
+function updateHose() {
+    const outlet = getHoseOutlet();
+    const hand = state.player.pos.clone();
+    hand.y -= 0.3;
+    // bring hand slightly forward of the player so the hose appears to be held
+    const forward = new THREE.Vector3(
+        -Math.sin(state.player.yaw), 0, -Math.cos(state.player.yaw));
+    hand.addScaledVector(forward, 0.4);
+
+    const dist = outlet.distanceTo(hand);
+    state.hoseConnected = dist <= SIM.HOSE_MAX_LENGTH;
+
+    // Drop amount based on distance - longer hose sags more
+    const sag = Math.min(2.0, dist * 0.08);
+
+    const pos = hoseLine.geometry.attributes.position.array;
+    for (let i = 0; i <= HOSE_SEGMENTS; i++) {
+        const t = i / HOSE_SEGMENTS;
+        // Lerp between outlet and hand
+        const x = outlet.x + (hand.x - outlet.x) * t;
+        const z = outlet.z + (hand.z - outlet.z) * t;
+        let y = outlet.y + (hand.y - outlet.y) * t;
+        // Catenary-ish sag (sin curve is a decent approximation for this length)
+        y -= Math.sin(t * Math.PI) * sag;
+        const idx = i * 3;
+        pos[idx]     = x;
+        pos[idx + 1] = y;
+        pos[idx + 2] = z;
+    }
+    hoseLine.geometry.attributes.position.needsUpdate = true;
+    hoseLine.geometry.computeBoundingSphere();
+}
 
 // ============================================================
 // EQUIPMENT (items stored inside compartments)
@@ -736,34 +1219,119 @@ createBuilding(-38, -25, 8, 12, 8, 0x6e6e8a);
 
 // ============================================================
 // FIRES
+// Radial gradient sprite + additive blending gives a volumetric glow
+// that looks much more like real flames than flat cones.
 // ============================================================
+function makeFlameSprite() {
+    const size = 128;
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const ctx = c.getContext('2d');
+    const grd = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    grd.addColorStop(0.0, 'rgba(255,255,200,1)');
+    grd.addColorStop(0.15, 'rgba(255,200,60,1)');
+    grd.addColorStop(0.4, 'rgba(255,90,10,0.85)');
+    grd.addColorStop(0.75, 'rgba(180,20,0,0.35)');
+    grd.addColorStop(1.0, 'rgba(120,0,0,0)');
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, 0, size, size);
+    const tex = new THREE.CanvasTexture(c);
+    tex.encoding = THREE.sRGBEncoding;
+    return tex;
+}
+
+function makeSmokeSprite() {
+    const size = 128;
+    const c = document.createElement('canvas');
+    c.width = c.height = size;
+    const ctx = c.getContext('2d');
+    const grd = ctx.createRadialGradient(size / 2, size / 2, 0, size / 2, size / 2, size / 2);
+    grd.addColorStop(0.0, 'rgba(80,80,80,0.9)');
+    grd.addColorStop(0.5, 'rgba(50,50,50,0.4)');
+    grd.addColorStop(1.0, 'rgba(30,30,30,0)');
+    ctx.fillStyle = grd;
+    ctx.fillRect(0, 0, size, size);
+    return new THREE.CanvasTexture(c);
+}
+
+const FLAME_TEX = makeFlameSprite();
+const SMOKE_TEX = makeSmokeSprite();
+
 function createFire(x, z) {
     const g = new THREE.Group();
     const flames = [];
-    for (let i = 0; i < 6; i++) {
-        const flame = new THREE.Mesh(
-            new THREE.ConeGeometry(0.4 + Math.random() * 0.25, 1.2 + Math.random() * 0.7, 8),
-            new THREE.MeshBasicMaterial({
-                color: i < 2 ? 0xff2200 : (i < 4 ? 0xff7700 : 0xffcc00),
-                transparent: true,
-                opacity: 0.85
-            })
+
+    // Multiple billboard flame sprites clustered and scaled differently
+    for (let i = 0; i < 14; i++) {
+        const mat = new THREE.SpriteMaterial({
+            map: FLAME_TEX,
+            color: 0xffffff,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false,
+            transparent: true,
+            opacity: 0.95,
+        });
+        const sprite = new THREE.Sprite(mat);
+        const r = Math.random() * 0.8;
+        const ang = Math.random() * Math.PI * 2;
+        sprite.position.set(
+            Math.cos(ang) * r,
+            0.4 + Math.random() * 1.6,
+            Math.sin(ang) * r
         );
-        flame.position.set(
-            (Math.random() - 0.5) * 0.8,
-            0.6 + Math.random() * 0.5,
-            (Math.random() - 0.5) * 0.8
-        );
-        flame.userData.baseY = flame.position.y;
-        flame.userData.phase = Math.random() * Math.PI * 2;
-        flames.push(flame);
-        g.add(flame);
+        const s = 1.2 + Math.random() * 1.6;
+        sprite.scale.set(s, s * 1.4, s);
+        sprite.userData.baseY = sprite.position.y;
+        sprite.userData.baseScale = s;
+        sprite.userData.phase = Math.random() * Math.PI * 2;
+        sprite.userData.speed = 0.8 + Math.random() * 0.6;
+        flames.push(sprite);
+        g.add(sprite);
     }
 
-    // Ember point light
-    const light = new THREE.PointLight(0xff5511, 1.6, 10);
+    // Drifting smoke sprites (non-additive, dark)
+    const smokeSprites = [];
+    for (let i = 0; i < 8; i++) {
+        const mat = new THREE.SpriteMaterial({
+            map: SMOKE_TEX,
+            color: 0x222222,
+            transparent: true,
+            opacity: 0.55,
+            depthWrite: false,
+        });
+        const sprite = new THREE.Sprite(mat);
+        sprite.position.set(
+            (Math.random() - 0.5) * 1.5,
+            2 + Math.random() * 2,
+            (Math.random() - 0.5) * 1.5
+        );
+        const s = 1.5 + Math.random() * 1.8;
+        sprite.scale.set(s, s, s);
+        sprite.userData.baseY = sprite.position.y;
+        sprite.userData.phase = Math.random() * Math.PI * 2;
+        sprite.userData.speed = 0.4 + Math.random() * 0.4;
+        smokeSprites.push(sprite);
+        g.add(sprite);
+    }
+
+    // Ember glow point light (physically correct -> much higher intensity)
+    const light = new THREE.PointLight(0xff5511, 25, 18, 2);
     light.position.y = 1.4;
     g.add(light);
+
+    // Charred base on the ground under the fire
+    const scorch = new THREE.Mesh(
+        new THREE.CircleGeometry(1.4, 24),
+        new THREE.MeshStandardMaterial({
+            color: 0x0a0a0a,
+            roughness: 1.0,
+            transparent: true,
+            opacity: 0.9,
+        })
+    );
+    scorch.rotation.x = -Math.PI / 2;
+    scorch.position.y = 0.03;
+    g.add(scorch);
 
     g.position.set(x, 0, z);
     scene.add(g);
@@ -771,8 +1339,13 @@ function createFire(x, z) {
     return {
         group: g,
         flames,
+        smoke: smokeSprites,
         light,
+        scorch,
         health: 100,
+        maxHealth: 100,
+        growScale: 1.0,           // grows with time, shrinks as fire is damaged
+        lastHitTime: 0,
         position: new THREE.Vector3(x, 0, z),
         extinguished: false,
     };
@@ -809,18 +1382,43 @@ const waterMat = new THREE.MeshBasicMaterial({
 });
 
 function spawnWaterParticles(origin, dir) {
-    for (let i = 0; i < 4; i++) {
-        const p = new THREE.Mesh(waterGeo, waterMat.clone());
-        p.position.copy(origin);
-        const spread = new THREE.Vector3(
-            (Math.random() - 0.5) * 0.25,
-            (Math.random() - 0.5) * 0.25,
-            (Math.random() - 0.5) * 0.25
-        );
-        p.userData.vel = dir.clone().multiplyScalar(16).add(spread.multiplyScalar(5));
-        p.userData.life = 1.0;
-        scene.add(p);
-        waterParticles.push(p);
+    if (state.nozzleMode === 'stream') {
+        // Tight, fast, long-range stream with heavy damage per particle
+        for (let i = 0; i < 3; i++) {
+            const p = new THREE.Mesh(waterGeo, waterMat.clone());
+            p.position.copy(origin);
+            const spread = new THREE.Vector3(
+                (Math.random() - 0.5) * 0.1,
+                (Math.random() - 0.5) * 0.1,
+                (Math.random() - 0.5) * 0.1
+            );
+            p.userData.vel = dir.clone().multiplyScalar(26).add(spread.multiplyScalar(3));
+            p.userData.life = 1.2;
+            p.userData.damage = SIM.STREAM_DAMAGE;
+            scene.add(p);
+            waterParticles.push(p);
+        }
+    } else {
+        // Wide fog cone with lots of small droplets, low damage per droplet
+        for (let i = 0; i < 10; i++) {
+            const p = new THREE.Mesh(waterGeo, waterMat.clone());
+            p.position.copy(origin);
+            // Random direction within a cone
+            const coneAngle = 0.35;
+            const theta = Math.random() * Math.PI * 2;
+            const r = Math.random() * coneAngle;
+            const right = new THREE.Vector3(-dir.z, 0, dir.x).normalize();
+            const up = new THREE.Vector3().crossVectors(dir, right).normalize();
+            const coneDir = dir.clone()
+                .addScaledVector(right, Math.sin(r) * Math.cos(theta))
+                .addScaledVector(up,    Math.sin(r) * Math.sin(theta))
+                .normalize();
+            p.userData.vel = coneDir.multiplyScalar(14 + Math.random() * 4);
+            p.userData.life = 0.7;
+            p.userData.damage = SIM.FOG_DAMAGE;
+            scene.add(p);
+            waterParticles.push(p);
+        }
     }
 }
 
@@ -835,14 +1433,17 @@ function updateWaterParticles(dt) {
         // Collide with any active fire
         for (const fire of state.fires) {
             if (fire.extinguished) continue;
-            if (p.position.distanceTo(fire.position) < 1.4 && p.position.y < 2.5) {
-                fire.health -= 12;
+            const hitRadius = 1.2 + fire.growScale * 0.4;
+            if (p.position.distanceTo(fire.position) < hitRadius && p.position.y < 3.0) {
+                fire.health -= (p.userData.damage || 12);
+                fire.lastHitTime = performance.now() / 1000;
                 p.userData.life = 0;
                 if (fire.health <= 0) {
                     fire.extinguished = true;
                     state.score += 100 * state.level;
                     updateHUD();
                     for (const f of fire.flames) f.visible = false;
+                    for (const s of fire.smoke) s.visible = false;
                     fire.light.intensity = 0;
                 }
                 break;
@@ -862,6 +1463,16 @@ function updateWaterParticles(dt) {
 document.addEventListener('keydown', e => {
     keys[e.code] = true;
     if (e.code === 'KeyE') tryInteract();
+    if (e.code === 'Digit1') {
+        state.nozzleMode = 'stream';
+        updateHUD();
+        showMessage('Vollstrahl', 1);
+    }
+    if (e.code === 'Digit2') {
+        state.nozzleMode = 'fog';
+        updateHUD();
+        showMessage('Sprühnebel', 1);
+    }
 });
 document.addEventListener('keyup', e => { keys[e.code] = false; });
 
@@ -902,8 +1513,9 @@ function tryInteract() {
     }
     if (state.nearbyHydrant) {
         state.water = state.maxWater;
+        state.air = state.maxAir;
         updateHUD();
-        showMessage('Wasser aufgefüllt!', 1.5);
+        showMessage('Wasser & Atemluft aufgefüllt!', 1.5);
     }
 }
 
@@ -998,9 +1610,21 @@ function update(dt) {
         prompt.classList.add('hidden');
     }
 
-    // --- Spraying water ---
-    if (state.spraying && state.water > 0 && state.running) {
-        state.water = Math.max(0, state.water - dt * 25);
+    // --- Hose line update (visible sagging tube from truck to player) ---
+    updateHose();
+    const hoseEl = document.getElementById('hose-status');
+    if (state.hoseConnected) {
+        hoseEl.textContent = 'CONNECTED';
+        hoseEl.classList.remove('disconnected');
+    } else {
+        hoseEl.textContent = 'OUT OF RANGE';
+        hoseEl.classList.add('disconnected');
+    }
+
+    // --- Spraying water (only if hose connected) ---
+    if (state.spraying && state.water > 0 && state.running && state.hoseConnected) {
+        const useRate = state.nozzleMode === 'stream' ? 18 : 32;
+        state.water = Math.max(0, state.water - dt * useRate);
         const origin = camera.position.clone().add(lookDir.clone().multiplyScalar(0.8));
         origin.y -= 0.25;
         spawnWaterParticles(origin, lookDir);
@@ -1009,16 +1633,108 @@ function update(dt) {
 
     updateWaterParticles(dt);
 
-    // --- Flame animation ---
+    // --- Smoke intensity (distance to nearest unextinguished fire) ---
+    let nearestFireDist = Infinity;
+    let activeFires = 0;
+    for (const fire of state.fires) {
+        if (fire.extinguished) continue;
+        activeFires++;
+        const d = state.player.pos.distanceTo(fire.position);
+        if (d < nearestFireDist) nearestFireDist = d;
+    }
+    // Smoke is thick within SMOKE_RADIUS and fades to 0 at 2x radius
+    let targetSmoke = 0;
+    if (nearestFireDist < SIM.SMOKE_RADIUS * 2) {
+        targetSmoke = Math.max(0,
+            1 - (nearestFireDist - SIM.SMOKE_RADIUS * 0.3) /
+                (SIM.SMOKE_RADIUS * 1.4));
+        targetSmoke = Math.min(1, targetSmoke);
+    }
+    state.smokeIntensity += (targetSmoke - state.smokeIntensity) * Math.min(1, dt * 3);
+
+    // Adjust fog + tone exposure to sell the smoke
+    scene.fog.color.setRGB(
+        0.75 - state.smokeIntensity * 0.6,
+        0.85 - state.smokeIntensity * 0.7,
+        0.94 - state.smokeIntensity * 0.8
+    );
+    scene.fog.near = 80 - state.smokeIntensity * 70;
+    scene.fog.far  = 300 - state.smokeIntensity * 270;
+    renderer.toneMappingExposure = 1.05 - state.smokeIntensity * 0.4;
+
+    // --- SCBA air depletion in smoke / refill at hydrant or truck ---
+    if (state.running) {
+        const outlet = getHoseOutlet();
+        const atTruck = state.player.pos.distanceTo(outlet) < 3.5;
+        if (state.nearbyHydrant || atTruck) {
+            state.air = Math.min(state.maxAir, state.air + dt * SIM.AIR_REFILL_RATE);
+        } else if (state.smokeIntensity > 0.2) {
+            state.air = Math.max(0,
+                state.air - dt * SIM.AIR_DEPLETE_PER_SEC * state.smokeIntensity);
+        }
+        if (state.air <= 0 && state.smokeIntensity > 0.4) {
+            // Suffocation hit - lose a life, respawn at truck
+            state.lives = Math.max(0, state.lives - 1);
+            state.air = state.maxAir * 0.5;
+            state.player.pos.set(10, 1.7, 12);
+            showMessage('Keine Luft mehr! Du wurdest evakuiert.', 3);
+            updateHUD();
+        }
+        updateHUD();
+    }
+
+    // Low-air warning flash
+    const warningEl = document.getElementById('warning-overlay');
+    if (state.air < 25 && state.smokeIntensity > 0.3) {
+        warningEl.classList.remove('hidden');
+    } else {
+        warningEl.classList.add('hidden');
+    }
+
+    // --- Fire growth: if a fire isn't hit recently, it grows ---
+    const now = performance.now() / 1000;
+    for (const fire of state.fires) {
+        if (fire.extinguished) continue;
+        const sinceHit = now - (fire.lastHitTime || 0);
+        if (sinceHit > 1.5 && fire.health < SIM.FIRE_MAX_HEALTH) {
+            fire.health = Math.min(
+                SIM.FIRE_MAX_HEALTH,
+                fire.health + SIM.FIRE_GROW_PER_SEC * dt);
+        }
+        // growScale reflects how big the fire is (0.5 small ... 1.8 raging)
+        const targetScale = 0.5 + (fire.health / SIM.FIRE_MAX_HEALTH) * 1.3;
+        fire.growScale += (targetScale - fire.growScale) * Math.min(1, dt * 2);
+        fire.group.scale.setScalar(fire.growScale);
+    }
+
+    // --- Flame animation (billboard sprites) ---
     const t = clock.getElapsedTime();
     for (const fire of state.fires) {
         if (fire.extinguished) continue;
         for (const f of fire.flames) {
-            f.position.y = f.userData.baseY + Math.sin(t * 8 + f.userData.phase) * 0.12;
-            f.scale.y = 0.9 + Math.sin(t * 10 + f.userData.phase) * 0.18;
-            f.rotation.y = t * 2 + f.userData.phase;
+            const wobble = Math.sin(t * 10 * f.userData.speed + f.userData.phase);
+            f.position.y = f.userData.baseY + wobble * 0.18;
+            const pulse = 1 + wobble * 0.12;
+            f.scale.set(
+                f.userData.baseScale * pulse,
+                f.userData.baseScale * 1.4 * pulse,
+                f.userData.baseScale * pulse
+            );
+            f.material.opacity = 0.75 + (Math.sin(t * 14 + f.userData.phase) + 1) * 0.12;
         }
-        fire.light.intensity = 1.4 + Math.sin(t * 12 + fire.position.x) * 0.5;
+        // Smoke drifts upward and fades at top, wraps back
+        for (const s of fire.smoke) {
+            s.position.y += s.userData.speed * dt;
+            s.position.x += Math.sin(t * 0.5 + s.userData.phase) * dt * 0.3;
+            if (s.position.y > s.userData.baseY + 6) {
+                s.position.y = s.userData.baseY;
+            }
+            const lifeFrac = (s.position.y - s.userData.baseY) / 6;
+            s.material.opacity = 0.55 * (1 - lifeFrac);
+            const ss = 1.5 + lifeFrac * 2;
+            s.scale.set(ss, ss, ss);
+        }
+        fire.light.intensity = 22 + Math.sin(t * 12 + fire.position.x) * 8;
     }
 
     // --- Light bar strobe ---
@@ -1069,9 +1785,15 @@ animate();
 // ============================================================
 function updateHUD() {
     document.getElementById('score').textContent = state.score;
-    document.getElementById('lives').textContent = state.lives;
     document.getElementById('level').textContent = state.level;
+    const activeFires = state.fires.filter(f => !f.extinguished).length;
+    document.getElementById('fires-left').textContent = activeFires;
     document.getElementById('water-fill').style.width = (state.water / state.maxWater * 100) + '%';
+    document.getElementById('air-fill').style.width = (state.air / state.maxAir * 100) + '%';
+    document.getElementById('nozzle-mode').textContent =
+        state.nozzleMode === 'stream' ? 'VOLLSTRAHL' : 'SPRÜHNEBEL';
+    const pat = document.getElementById('nozzle-pattern');
+    if (pat) pat.className = 'nozzle-pattern' + (state.nozzleMode === 'fog' ? ' fog' : '');
 }
 
 function showMessage(text, duration) {

@@ -9,16 +9,37 @@
 <body>
     <div id="canvas-container"></div>
 
+    <!-- Helmet visor vignette (first-person immersion) -->
+    <div id="visor"></div>
+    <!-- Red low-air / danger flash -->
+    <div id="warning-overlay" class="hidden"></div>
+
     <div id="hud">
         <div class="hud-block">
             <div class="hud-row"><span class="label">SCORE</span><span id="score">0</span></div>
             <div class="hud-row"><span class="label">LEVEL</span><span id="level">1</span></div>
-            <div class="hud-row"><span class="label">LIVES</span><span id="lives">3</span></div>
+            <div class="hud-row"><span class="label">FIRES</span><span id="fires-left">0</span></div>
         </div>
-        <div class="hud-block water-block">
-            <div class="label">WATER</div>
-            <div class="water-bar"><div id="water-fill"></div></div>
+        <div class="hud-block gauge-block">
+            <div class="gauge-row">
+                <span class="label">TANK</span>
+                <div class="gauge"><div id="water-fill"></div></div>
+            </div>
+            <div class="gauge-row">
+                <span class="label">AIR</span>
+                <div class="gauge"><div id="air-fill"></div></div>
+            </div>
         </div>
+        <div class="hud-block">
+            <div class="hud-row"><span class="label">NOZZLE</span><span id="nozzle-mode">STREAM</span></div>
+            <div class="hud-row"><span class="label">HOSE</span><span id="hose-status">-</span></div>
+        </div>
+    </div>
+
+    <!-- Bottom-center nozzle schematic -->
+    <div id="nozzle-icon">
+        <div class="nozzle-body"></div>
+        <div class="nozzle-pattern" id="nozzle-pattern"></div>
     </div>
 
     <div id="crosshair">+</div>
@@ -34,6 +55,7 @@
                 <p><strong>WASD / Pfeiltasten</strong> &mdash; Bewegen</p>
                 <p><strong>Maus</strong> &mdash; Umsehen</p>
                 <p><strong>Linksklick</strong> &mdash; Wasser spritzen</p>
+                <p><strong>1 / 2</strong> &mdash; Strahlrohr: Vollstrahl / Sprühnebel</p>
                 <p><strong>E</strong> &mdash; Gerätefach öffnen / Hydrant</p>
                 <p><strong>ESC</strong> &mdash; Mauszeiger freigeben</p>
             </div>
@@ -43,6 +65,7 @@
     </div>
 
     <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/objects/Sky.js"></script>
     <script src="game.js"></script>
 </body>
 </html>
