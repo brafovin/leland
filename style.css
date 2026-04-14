@@ -81,10 +81,9 @@ h1 {
 
 canvas {
     display: block;
-    background: #2d5016;
+    background: #3e6b1e;
     border: 2px solid #333;
     border-radius: 6px;
-    image-rendering: pixelated;
 }
 
 .overlay {
