@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Feuerwehr - Das Spiel</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="game-container">
+        <h1>Feuerwehr - Das Spiel</h1>
+        <div class="hud">
+            <div class="hud-item">
+                <span class="label">Punkte:</span>
+                <span id="score">0</span>
+            </div>
+            <div class="hud-item">
+                <span class="label">Wasser:</span>
+                <div class="water-bar">
+                    <div id="water-fill" class="water-fill"></div>
+                </div>
+            </div>
+            <div class="hud-item">
+                <span class="label">Leben:</span>
+                <span id="lives">3</span>
+            </div>
+            <div class="hud-item">
+                <span class="label">Level:</span>
+                <span id="level">1</span>
+            </div>
+        </div>
+        <canvas id="game" width="800" height="600"></canvas>
+        <div id="overlay" class="overlay">
+            <div class="overlay-content">
+                <h2 id="overlay-title">Feuerwehr</h2>
+                <p id="overlay-message">Lösche alle Brände, bevor die Gebäude abbrennen!</p>
+                <div class="controls-help">
+                    <p><strong>Steuerung:</strong></p>
+                    <p>Pfeiltasten oder WASD - Bewegen</p>
+                    <p>Leertaste - Wasser spritzen</p>
+                    <p>Hydranten (blau) berühren - Tank auffüllen</p>
+                </div>
+                <button id="start-btn">Start</button>
+            </div>
+        </div>
+    </div>
+    <script src="game.js"></script>
+</body>
+</html>
